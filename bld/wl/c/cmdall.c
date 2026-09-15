@@ -741,6 +741,19 @@ static bool ProcQuiet( void )
     return( true );
 }
 
+static bool ProcWeakAlias( void )
+/******************************/
+/* option weakalias: treat OMF ALIAS records as weak definitions:
+ * a strong public definition found anywhere (including a later library
+ * member) overrides the alias, and only aliases still undefined after the
+ * library search are welded to their target.  Required for weak_alias()
+ * support in C libraries linked through this toolchain.
+ */
+{
+    LinkFlags |= LF_WEAK_ALIAS_FLAG;
+    return( true );
+}
+
 static bool ProcMangledNames( void )
 /**********************************/
 {
@@ -1965,7 +1978,8 @@ static parse_entry  MainOptions[] = {
     "STack",        ProcStack,          MK_ALL, 0,
     "NODefaultlibs",ProcNoDefLibs,      MK_ALL, CF_NO_DEF_LIBS,
     "Quiet",        ProcQuiet,          MK_ALL, 0,
-    "Dosseg",       ProcDosSeg,         MK_ALL, 0,
+    "WEAKAlias",    ProcWeakAlias,      MK_ALL, 0,
+    "Dosseg",       ProcDosSeg,          MK_ALL, 0,
     "Caseexact",    ProcCase,           MK_ALL, 0,
     "Verbose",      ProcVerbose,        MK_ALL, 0,
     "Undefsok",     ProcUndefsOK,       MK_ALL, 0,

@@ -311,9 +311,12 @@ static void GetFrameAddr( frame_spec *frame, addr_type *frame_addr,
     case FIX_FRAME_GRP:
         *frame_addr = frame->u.group->addr;
         break;
-    case FIX_FRAME_EXT:
-        *frame_addr = frame->u.sym->addr;
+    case FIX_FRAME_EXT: {
+        symbol *usym = UnaliasSym( ST_FIND, frame->u.sym );
+        if( usym == NULL ) usym = frame->u.sym;
+        *frame_addr = usym->addr;
         break;
+    }
     case FIX_FRAME_ABS:
         frame_addr->seg = frame->u.abs;
         break;
@@ -339,9 +342,12 @@ static void GetTargetAddr( target_spec *target, addr_type *target_addr )
     case FIX_TARGET_GRP:
         *target_addr = target->u.group->addr;
         break;
-    case FIX_TARGET_EXT:
-        *target_addr = target->u.sym->addr;
+    case FIX_TARGET_EXT: {
+        symbol *usym = UnaliasSym( ST_FIND, target->u.sym );
+        if( usym == NULL ) usym = target->u.sym;
+        *target_addr = usym->addr;
         break;
+    }
     case FIX_TARGET_ABS:
         target_addr->seg = target->u.abs;
         break;

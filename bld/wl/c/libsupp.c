@@ -46,6 +46,7 @@
 #include "library.h"
 #include "procfile.h"
 #include "objio.h"
+#include "objnode.h"
 
 #include "clibext.h"
 
@@ -62,6 +63,23 @@ static bool SearchAndProcLibFile( file_list *file, const char *name )
     if( lp == NULL ) {
         CacheClose( file, 1 );
         return( false );
+    }
+    /* don't extract a library member that has already been processed:
+     * a symbol can be searched again after the member holding it was
+     * already pulled in (e.g. option weakalias re-searches alias names),
+     * and re-processing a member would duplicate it in the image
+     */
+    {
+        mod_entry   *curr;
+
+        for( curr = LibModules; curr != NULL; curr = curr->u.next ) {
+            if( curr->u1.source == lp->u1.source
+              && curr->location == lp->location ) {
+                FreeModEntry( lp );
+                CacheClose( file, 1 );
+                return( false );
+            }
+        }
     }
     file->flags_file |= STAT_LIB_USED;
 #ifdef _EXE

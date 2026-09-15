@@ -57,6 +57,7 @@ typedef enum {
     LF_FAR_CALLS_FLAG       = 0x00400000,   // optimize far calls
     LF_HLL_DBI_FLAG         = 0x00800000,   // write HLL debug Info.
     LF_HLLPACK_FLAG         = 0x01000000,   // pack HLL debug info.
+    LF_WEAK_ALIAS_FLAG      = 0x02000000,   // treat OMF ALIAS records as weak definitions.
 } linkflag;
 
 // Novell treated differently, as it can be generated at the same time as the others.

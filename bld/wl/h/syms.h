@@ -96,6 +96,9 @@ typedef enum {
     SYM_LINK_GEN        = 0x00400000U,   // is a linker generated symbol
     SYM_HAS_DATA        = 0x00800000U,   // only used for altdefs
     SYM_NAME_XLATED     = 0x01000000U,   // only used during permdata writing
+    SYM_WEAK_ALIAS      = 0x02000000U,   // lazy ref from an OMF ALIAS record
+                                        // (option weakalias); must not be
+                                        // collapsed back to a plain reference
     SYM_IS_FREE         = 0x10000000U,   // only used during permdata writing.
 
 // the top three bits are used for the

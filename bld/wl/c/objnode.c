@@ -233,7 +233,8 @@ static void CollapseLazy( void *node, void *dummy )
     /* unused parameters */ (void)dummy;
 
     curr = node;
-    if( IS_SYM_A_REF( curr->entry ) && !curr->isweak ) {
+    if( IS_SYM_A_REF( curr->entry ) && !curr->isweak
+      && (curr->entry->info & SYM_WEAK_ALIAS) == 0 ) {
         ClearSymUnion( curr->entry );
         SET_SYM_TYPE( curr->entry, SYM_REGULAR );
         if( LinkState & LS_SEARCHING_LIBRARIES ) {

@@ -278,6 +278,7 @@ static void ProcAlias( void )
     size_t      aliaslen;
     size_t      targetlen;
     symbol      *sym;
+    symbol      *targ;
 
     for( ; ObjBuff < EOObjRec; ObjBuff += targetlen ) {
         aliaslen = *ObjBuff++;
@@ -287,7 +288,64 @@ static void ProcAlias( void )
         sym = SymOp( ST_FIND | ST_NOALIAS, alias, aliaslen );
         if( sym == NULL
           || (sym->info & SYM_DEFINED) == 0 ) {
-            MakeSymAlias( alias, aliaslen, (const char *)ObjBuff, targetlen );
+            if( (LinkFlags & LF_WEAK_ALIAS_FLAG) != 0
+              && aliaslen != targetlen ) {
+                /* option weakalias: register the alias as a lazy reference
+                 * instead of binding it immediately; a strong public
+                 * definition found anywhere (including a later library
+                 * member) overrides the alias, and only aliases still
+                 * undefined after the library search are welded to their
+                 * target (ConvertLazyRefs).  this gives OMF ALIAS records
+                 * order-independent weak-definition semantics, as
+                 * required for weak_alias() in C libraries
+                 */
+                extnode     *newnode;
+
+                sym = SymOp( ST_CREATE | ST_NOALIAS, alias, aliaslen );
+                targ = SymOp( ST_CREATE, (const char *)ObjBuff, targetlen );
+                /* add a weak extdef entry so CollapseLazyExtdefs() does not
+                 * demote the lazy reference back to a plain undefined symbol
+                 * when the module's pass 1 completes (mirrors WKEXT/LZEXT
+                 * handling in DoLazyExtdef)
+                 */
+                newnode = AllocNode( ExtNodes );
+                newnode->entry = sym;
+                newnode->isweak = true;
+                /* register the lazy reference; unlike DefineLazyExtdef()
+                 * this must not be gated on SYM_OLDHAT, since the alias name
+                 * has usually been referenced by an earlier object already
+                 */
+                if( (sym->info & (SYM_DEFINED | SYM_EXPORTED)) == 0
+                  && !IS_SYM_IMPORTED( sym )
+                  && !IS_SYM_COMMUNAL( sym ) ) {
+                    if( IS_SYM_A_REF( sym )
+                      && !IS_SYM_LINK_WEAK( sym ) ) {
+                        if( targ != sym->e.def ) {
+                            LnkMsg( WRN+LOC_REC+MSG_LAZY_EXTDEF_MISMATCH, "S", sym );
+                        }
+                    } else {
+                        /* SYM_WEAK_REF: like GNU weak definitions, the
+                         * alias must NOT trigger library extraction (a
+                         * strong definition still overrides it when the
+                         * defining member is pulled in for other reasons),
+                         * and an unresolved alias welds to its target at
+                         * the end of the link (ConvertLazyRefs)
+                         */
+                        SET_SYM_TYPE( sym, SYM_WEAK_REF );
+                        sym->e.def = targ;
+                        /* mark so CollapseLazyExtdefs() never demotes this
+                         * lazy reference back to a plain undefined symbol
+                         * when a later module references the alias name
+                         */
+                        sym->info |= SYM_WEAK_ALIAS;
+                        if( LinkFlags & LF_STRIP_CODE ) {
+                            DataRef( sym->e.def );
+                        }
+                    }
+                }
+            } else {
+                MakeSymAlias( alias, aliaslen, (const char *)ObjBuff, targetlen );
+            }
         }
     }
 }
