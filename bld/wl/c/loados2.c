@@ -292,7 +292,10 @@ static void WriteOS2Data( unsigned_32 stub_len, os2_exe_header *exe_head )
         // write segment
         segrec.min = __ROUND_UP_SIZE_EVEN( group->totalsize );
         segrec.size = __ROUND_UP_SIZE_EVEN( group->size );
-        if( segrec.size != 0 ) {
+        // NE encodes a 65536-byte segment as size 0. Test the pre-truncation
+        // size, or exactly-64KB segments are treated as empty and lose
+        // their file data.
+        if( group->size != 0 ) {
             off = NullAlign( 1 << FmtData.u.os2fam.segment_shift );
             seg_addr = off >> FmtData.u.os2fam.segment_shift;
             if( seg_addr > 0xffff ) {
