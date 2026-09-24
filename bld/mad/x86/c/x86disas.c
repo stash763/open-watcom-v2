@@ -43,6 +43,9 @@
 #define OP_1            0
 
 static dis_handle       DH;
+/* wdbg build marker: referenced by DisasmInit so it is never eliminated;
+ * lets us verify from a crash address which madx86.d32 build is loaded */
+const char WdbgMadBuild[] = "WDBG-MADX86-B2-2026-09-22";
 address                 DbgAddr;
 static dword            RegValue( const mad_registers *mr, int idx );
 static char             ScratchBuff[40];
@@ -987,6 +990,9 @@ size_t DisCliValueString( void *d, dis_dec_ins *ins, unsigned opnd, char *buff, 
 
 mad_status DisasmInit( void )
 {
+    if( WdbgMadBuild[0] != 'W' ) {
+        return( MS_ERR | MS_FAIL );
+    }
     if( DisInit( DISCPU_X86, &DH, false ) != DR_OK ) {
         return( MS_ERR | MS_FAIL );
     }
