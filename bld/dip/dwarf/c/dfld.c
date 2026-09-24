@@ -76,9 +76,9 @@ static uint Lookup_section_name( const char *name )
 static uint_16 BufReadU16( void *u16, bool big_endian )
 {
     if( big_endian ) {
-        return( MGET_BE_U32( u16 ) );
+        return( MGET_BE_U16( u16 ) );
     } else {
-        return( MGET_LE_U32( u16 ) );
+        return( MGET_LE_U16( u16 ) );
     }
 }
 
@@ -96,9 +96,6 @@ static bool read_Shdr( FILE *fp, Elf32_Shdr *elf_sec, bool big_endian )
 {
     char    tmp32[4];
 
-    if( DCRead( fp, tmp32, sizeof( tmp32 ) ) != sizeof( tmp32 ) )
-        return( true );
-    elf_sec->sh_name = BufReadU32( tmp32, big_endian );
     if( DCRead( fp, tmp32, sizeof( tmp32 ) ) != sizeof( tmp32 ) )
         return( true );
     elf_sec->sh_name = BufReadU32( tmp32, big_endian );
