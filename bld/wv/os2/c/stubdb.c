@@ -32,6 +32,8 @@
 
 #include <stdio.h>
 #include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
 #include <process.h>
 #define INCL_DOS
 #include <os2.h>
@@ -39,6 +41,10 @@
 #include "dbgdata.h"
 #include "liteng.h"
 #include "mad.h"
+#include "madcli.h"
+#include "dbgitem.h"
+#include "dbgreg.h"
+#include "dbgmad.h"
 #include "dui.h"
 #include "dbgvar.h"
 #include "dbgstk.h"
@@ -340,6 +346,637 @@ void DlgCmd( void )
     }
 }
 
+/*
+ * td2ine-compatible command line autostep
+ *
+ *   dve [options] <program> [args...]
+ *     --autostep N          auto-step through N instructions, print state
+ *                           per step, then exit (like td2ine)
+ *     --autostep-mode M     'into' (default) or 'over'
+ *     --autostep-into-api   step into OS/2 API calls (default: step over them)
+ *     --trace-calls         only print call/return instructions
+ *     --loop-detect         detect repeated address sequences (report to stderr)
+ *     --break-at SEG:OFF    run at native speed until PC hits SEG:OFF, then
+ *                           report state (alias: --break-linear)
+ *     --dump-linear SEG:OFF:LEN
+ *                           dump guest memory at the stop (repeatable, max 16)
+ *     --symbols <file>     accepted for CLI compatibility (ignored: symbols
+ *                           come from the DWARF DIP)
+ *     --help                print usage and exit
+ */
+
+#define MAX_AUTO_DUMPS  16
+#define LOOP_HISTORY     1024
+#define LOOP_MIN_SEQ     2
+#define LOOP_MAX_SEQ     32
+
+static unsigned        AutoStepCount;
+static bool            AutoStepOver;
+static bool            AutoStepIntoAPI;
+static bool            AutoTraceCalls;
+static bool            AutoLoopDetect;
+static bool            AutoHaveBreak;
+static address         AutoBreakAddr;
+static address         AutoDumpAddrs[MAX_AUTO_DUMPS];
+static size_t          AutoDumpLens[MAX_AUTO_DUMPS];
+static unsigned        AutoDumpCount;
+
+typedef struct {
+    addr_seg            seg;
+    addr_off            off;
+} loop_addr;
+
+static loop_addr       LoopHist[LOOP_HISTORY];
+static unsigned        LoopHistCount;
+static bool            LoopDetected;
+static char            PrevSource[256];
+
+static char *SkipBlanks( char *p )
+{
+    while( *p == ' ' || *p == '\t' )
+        ++p;
+    return( p );
+}
+
+static size_t TokenLen( char *p )
+{
+    size_t  len = 0;
+
+    while( p[len] != NULLCHAR && p[len] != ' ' && p[len] != '\t' )
+        ++len;
+    return( len );
+}
+
+static bool TokenIs( char *p, const char *s )
+{
+    size_t  len = strlen( s );
+
+    return( TokenLen( p ) == len && strncmp( p, s, len ) == 0 );
+}
+
+static void PrintUsage( void )
+{
+    printf( "Usage: dve [options] <program> [args...]\n" );
+    printf( "  --autostep N              Auto-step through N instructions and print assembly\n" );
+    printf( "  --autostep-mode M         Stepping mode for autostep: 'into' (default) or 'over'\n" );
+    printf( "  --autostep-into-api        Step into OS/2 API calls (default: step over them)\n" );
+    printf( "  --trace-calls             Only print call/return instructions (with symbols)\n" );
+    printf( "  --loop-detect             Detect loops in autostep (repeated address sequences)\n" );
+    printf( "  --break-at SEG:OFF         Run at native speed until PC hits SEG:OFF, then report state\n" );
+    printf( "  --dump-linear SEG:OFF:LEN Dump guest memory at the stop (repeatable, max %u)\n",
+            (unsigned)MAX_AUTO_DUMPS );
+    printf( "  --symbols <file>          Accepted for compatibility (ignored: DWARF DIP is used)\n" );
+    printf( "  --help                    Print this usage message and exit\n" );
+}
+
+static bool ParseHexVal( char **pp, unsigned long *val )
+{
+    char    *p = *pp;
+    char    *end;
+
+    if( p[0] == '0' && ( p[1] == 'x' || p[1] == 'X' ) )
+        p += 2;
+    *val = strtoul( p, &end, 16 );
+    if( end == p )
+        return( false );
+    *pp = end;
+    return( true );
+}
+
+static bool ParseSegOff( char **pp, address *addr )
+{
+    unsigned long   seg;
+    unsigned long   off;
+
+    if( !ParseHexVal( pp, &seg ) || **pp != ':' )
+        return( false );
+    ++*pp;
+    if( !ParseHexVal( pp, &off ) )
+        return( false );
+    addr->mach.segment = (addr_seg)seg;
+    addr->mach.offset = (addr_off)off;
+    addr->sect_id = 0;
+    addr->indirect = 0;
+    return( true );
+}
+
+static char *BaseName( char *path )
+{
+    char    *p;
+
+    p = strrchr( path, '\\' );
+    if( p == NULL )
+        p = strrchr( path, '/' );
+    if( p == NULL )
+        return( path );
+    return( p + 1 );
+}
+
+static void ParseAutoStepOptions( char *cmd )
+{
+    char    *p = cmd;
+    char    *end;
+    size_t  len;
+    char    mode[16];
+    unsigned long n;
+    unsigned long dumplen;
+
+    for( ;; ) {
+        p = SkipBlanks( p );
+        if( TokenIs( p, "--autostep" ) ) {
+            p += TokenLen( p );
+            p = SkipBlanks( p );
+            n = strtoul( p, &end, 10 );
+            if( end == p ) {
+                printf( "autostep: missing step count\n" );
+            } else {
+                AutoStepCount = (unsigned)n;
+                p = end;
+            }
+        } else if( TokenIs( p, "--autostep-mode" ) ) {
+            p += TokenLen( p );
+            p = SkipBlanks( p );
+            len = TokenLen( p );
+            if( len == 0 ) {
+                printf( "autostep: missing mode (use into|over)\n" );
+            } else {
+                if( len >= sizeof( mode ) )
+                    len = sizeof( mode ) - 1;
+                memcpy( mode, p, len );
+                mode[len] = NULLCHAR;
+                if( stricmp( mode, "over" ) == 0 ) {
+                    AutoStepOver = true;
+                } else if( stricmp( mode, "into" ) == 0 ) {
+                    AutoStepOver = false;
+                } else {
+                    printf( "autostep: unknown mode '%s' (use into|over)\n", mode );
+                }
+                p += TokenLen( p );
+            }
+        } else if( TokenIs( p, "--autostep-into-api" ) ) {
+            AutoStepIntoAPI = true;
+            p += TokenLen( p );
+        } else if( TokenIs( p, "--trace-calls" ) ) {
+            AutoTraceCalls = true;
+            p += TokenLen( p );
+        } else if( TokenIs( p, "--loop-detect" ) ) {
+            AutoLoopDetect = true;
+            p += TokenLen( p );
+        } else if( TokenIs( p, "--break-at" ) || TokenIs( p, "--break-linear" ) ) {
+            p += TokenLen( p );
+            p = SkipBlanks( p );
+            if( !ParseSegOff( &p, &AutoBreakAddr ) ) {
+                printf( "autostep: --break-at expects SEG:OFF (hex)\n" );
+            } else {
+                AutoHaveBreak = true;
+            }
+        } else if( TokenIs( p, "--dump-linear" ) ) {
+            p += TokenLen( p );
+            p = SkipBlanks( p );
+            if( AutoDumpCount >= MAX_AUTO_DUMPS ) {
+                printf( "autostep: too many --dump-linear (max %u)\n", (unsigned)MAX_AUTO_DUMPS );
+                p += TokenLen( p );
+            } else if( !ParseSegOff( &p, &AutoDumpAddrs[AutoDumpCount] ) || *p != ':' ) {
+                printf( "autostep: --dump-linear expects SEG:OFF:LEN (hex)\n" );
+                if( *p == ':' )
+                    ++p;
+                p += TokenLen( p );
+            } else {
+                ++p;
+                if( !ParseHexVal( &p, &dumplen ) ) {
+                    printf( "autostep: --dump-linear expects SEG:OFF:LEN (hex)\n" );
+                } else {
+                    AutoDumpLens[AutoDumpCount] = (size_t)dumplen;
+                    ++AutoDumpCount;
+                }
+            }
+        } else if( TokenIs( p, "--symbols" ) ) {
+            p += TokenLen( p );
+            p = SkipBlanks( p );
+            p += TokenLen( p );
+            printf( "autostep: --symbols ignored (symbols come from DWARF debug info)\n" );
+        } else if( TokenIs( p, "--help" ) ) {
+            PrintUsage();
+            exit( 0 );
+        } else {
+            break;
+        }
+    }
+    /* remove the consumed options from the engine command line */
+    memmove( cmd, p, strlen( p ) + 1 );
+}
+
+/*
+ * SymLookup - find the innermost procedure/code symbol containing addr and
+ * return its source name plus the offset of addr from the symbol start
+ * (like td2ine's symbol_map_lookup).
+ */
+static bool SymLookup( address addr, char *buff, size_t buff_size, unsigned long *poff )
+{
+    DIPHDL( sym, sh );
+    sym_info        info;
+    location_list   ll;
+    address         start;
+    size_t          nlen;
+
+    if( DeAliasAddrSym( NO_MOD, addr, sh ) == SR_NONE )
+        return( false );
+    if( DIPSymInfo( sh, NULL, &info ) != DS_OK )
+        return( false );
+    if( info.kind != SK_PROCEDURE && info.kind != SK_CODE )
+        return( false );
+    if( DIPSymLocation( sh, NULL, &ll ) != DS_OK || ll.num == 0 )
+        return( false );
+    if( ll.e[0].type != LT_ADDR )
+        return( false );
+    start = ll.e[0].u.addr;
+    nlen = DIPSymName( sh, NULL, SNT_SOURCE, buff, buff_size );
+    if( nlen == 0 || nlen >= buff_size )
+        return( false );
+    *poff = (unsigned long)( addr.mach.offset - start.mach.offset );
+    return( true );
+}
+
+/*
+ * LoopRecord - record one step address and check whether the last steps form
+ * a short sequence repeated three times (like td2ine --loop-detect).
+ */
+static void LoopRecord( address addr, unsigned step )
+{
+    loop_addr       *h;
+    int             seqlen;
+    int             start;
+    int             r;
+    int             j;
+    bool            match;
+    char            symbuff[256];
+    unsigned long   symoff;
+    address         a;
+
+    if( LoopHistCount < LOOP_HISTORY ) {
+        h = &LoopHist[LoopHistCount++];
+    } else {
+        memmove( &LoopHist[0], &LoopHist[1], ( LOOP_HISTORY - 1 ) * sizeof( LoopHist[0] ) );
+        h = &LoopHist[LOOP_HISTORY - 1];
+    }
+    h->seg = addr.mach.segment;
+    h->off = addr.mach.offset;
+    if( LoopDetected || LoopHistCount < LOOP_MIN_SEQ * 3 )
+        return;
+    for( seqlen = LOOP_MIN_SEQ; seqlen <= LOOP_MAX_SEQ && !LoopDetected; ++seqlen ) {
+        start = (int)LoopHistCount - seqlen * 3;
+        if( start < 0 )
+            continue;
+        match = true;
+        for( r = 0; r < 3 && match; ++r ) {
+            for( j = 0; j < seqlen; ++j ) {
+                if( LoopHist[start + r * seqlen + j].seg != LoopHist[start + j].seg
+                  || LoopHist[start + r * seqlen + j].off != LoopHist[start + j].off ) {
+                    match = false;
+                    break;
+                }
+            }
+        }
+        if( !match )
+            continue;
+        LoopDetected = true;
+        fprintf( stderr, "\n=== LOOP DETECTED (sequence length %d, starting at step %d) ===\n",
+                 seqlen, (int)step - seqlen * 2 );
+        for( j = 0; j < seqlen; ++j ) {
+            a.mach.segment = LoopHist[start + j].seg;
+            a.mach.offset = LoopHist[start + j].off;
+            a.sect_id = 0;
+            a.indirect = 0;
+            if( SymLookup( a, symbuff, sizeof( symbuff ), &symoff ) ) {
+                fprintf( stderr, "  %04X:%04lX  %s+0x%lX\n", a.mach.segment,
+                         (unsigned long)a.mach.offset, symbuff, symoff );
+            } else {
+                fprintf( stderr, "  %04X:%04lX  (unknown)\n", a.mach.segment,
+                         (unsigned long)a.mach.offset );
+            }
+        }
+        fprintf( stderr, "=== Last %d steps before loop ===\n", seqlen * 3 );
+    }
+}
+
+static void DumpRegisters( void )
+{
+    const mad_reg_set_data    *rsd;
+    const mad_reg_info        *ri;
+    const char                *descript;
+    size_t                    max_descript;
+    size_t                    max_value;
+    mad_type_handle           mth;
+    mad_radix                 radix, old_radix;
+    item_mach                 value;
+    char                      valbuff[64];
+    unsigned                  piece;
+    unsigned                  per_line;
+    unsigned                  n;
+
+    if( DbgRegs == NULL )
+        return;
+    rsd = NULL;
+    RegFindData( MTK_INTEGER, &rsd );
+    if( rsd == NULL )
+        return;
+    per_line = MADRegSetDisplayGrouping( rsd );
+    if( per_line == 0 )
+        per_line = 4;
+    n = 0;
+    for( piece = 0; ; ++piece ) {
+        if( MADRegSetDisplayGetPiece( rsd, &DbgRegs->mr, piece, &descript, &max_descript, &ri, &mth, &max_value ) != MS_OK )
+            break;
+        if( ri == NULL ) {
+            if( n != 0 ) {
+                printf( "\n" );
+                n = 0;
+            }
+            printf( "  %s\n", descript == NULL ? "" : descript );
+            continue;
+        }
+        radix = MADTypePreferredRadix( mth );
+        old_radix = NewCurrRadix( radix );
+        RegValue( &value, ri, DbgRegs );
+        max_value = sizeof( valbuff );
+        MADTypeHandleToString( radix, mth, &value, valbuff, &max_value );
+        NewCurrRadix( old_radix );
+        printf( "%s%s=%s", n == 0 ? "  " : " ", descript == NULL ? "?" : descript, valbuff );
+        ++n;
+        if( n >= per_line ) {
+            printf( "\n" );
+            n = 0;
+        }
+    }
+    if( n != 0 )
+        printf( "\n" );
+}
+
+static void PrintStep( unsigned step, address addr, mad_disasm_data *dd, const char *text )
+{
+    address             sp;
+    unsigned_8          bytes[16];
+    size_t              got;
+    unsigned            nbytes;
+    char                sbuff[256];
+    char                fbuf[256];
+    char                symbuff[256];
+    char                *ir;
+    char                *base;
+    unsigned long       symoff;
+    unsigned long       line;
+    DIPHDL( cue, cueh );
+    unsigned            i;
+
+    printf( "--- Step %u ---\n", step );
+    if( SymLookup( addr, symbuff, sizeof( symbuff ), &symoff ) ) {
+        if( symoff == 0 ) {
+            printf( "  CS:IP=%04X:%04lX  %s\n", addr.mach.segment,
+                     (unsigned long)addr.mach.offset, symbuff );
+        } else {
+            printf( "  CS:IP=%04X:%04lX  %s+0x%lX\n", addr.mach.segment,
+                     (unsigned long)addr.mach.offset, symbuff, symoff );
+        }
+    } else {
+        printf( "  CS:IP=%04X:%04lX\n", addr.mach.segment, (unsigned long)addr.mach.offset );
+    }
+    printf( "  Bytes: " );
+    nbytes = 0;
+    if( dd != NULL ) {
+        nbytes = MADDisasmInsSize( dd );
+        if( nbytes > 8 )
+            nbytes = 8;
+    }
+    got = 0;
+    if( nbytes > 0 )
+        got = MADCliReadMem( addr, nbytes, bytes );
+    if( nbytes > 0 && got == nbytes ) {
+        for( i = 0; i < nbytes; ++i ) {
+            printf( "%02X ", bytes[i] );
+        }
+        for( i = nbytes; i < 8; ++i ) {
+            printf( "   " );
+        }
+    } else {
+        printf( "???????? " );
+    }
+    printf( "\n" );
+    if( dd != NULL ) {
+        printf( "  ASM:   %s\n", text );
+    } else {
+        printf( "  ASM:   (decode failed)\n" );
+    }
+    DumpRegisters();
+    sp = GetRegSP();
+    got = MADCliReadMem( sp, 16, bytes );
+    printf( "  Stack: SS:SP=%04X:%04lX", sp.mach.segment, (unsigned long)sp.mach.offset );
+    for( i = 0; i + 1 < got; i += 2 ) {
+        printf( "  [%04lX]=%02X%02X", (unsigned long)( sp.mach.offset + i ), bytes[i + 1], bytes[i] );
+    }
+    printf( "\n" );
+    if( DeAliasAddrCue( NO_MOD, addr, cueh ) != SR_NONE
+      && DUIGetSourceLine( cueh, sbuff, sizeof( sbuff ) ) ) {
+        DIPCueFile( cueh, fbuf, sizeof( fbuf ) );
+        line = DIPCueLine( cueh );
+        base = BaseName( fbuf );
+        if( PrevSource[0] == NULLCHAR || strcmp( PrevSource, base ) != 0 ) {
+            printf( "  >>> Source: %s <<<\n", base );
+            strncpy( PrevSource, base, sizeof( PrevSource ) - 1 );
+            PrevSource[sizeof( PrevSource ) - 1] = NULLCHAR;
+        }
+        printf( "  DWARF: %s:%lu\n", fbuf, line );
+        printf( "  %4lu  %s\n", line, sbuff );
+        ir = strstr( sbuff, "; IR:" );
+        if( ir != NULL ) {
+            ir += 5;
+            while( *ir == ' ' || *ir == '\t' )
+                ++ir;
+            printf( "  IR:  %s\n", ir );
+        }
+    }
+}
+
+static void AutoStepRun( void )
+{
+    address             addr;
+    address             target;
+    mad_disasm_data     *dd;
+    mad_disasm_control   ctrl;
+    mad_disasm_control   type;
+    mod_handle          mh;
+    trace_cmd_type      trace;
+    char                buff[256];
+    bool                decoded;
+    unsigned            step;
+
+    printf( "=== Auto-Step: %u steps (mode: %s, OS/2 API: %s%s%s) ===\n\n", AutoStepCount,
+            AutoStepOver ? "step-over" : "step-into",
+            AutoStepIntoAPI ? "step-into" : "step-over",
+            AutoTraceCalls ? ", trace-calls" : "",
+            AutoLoopDetect ? ", loop-detect" : "" );
+    PrevSource[0] = NULLCHAR;
+    LoopHistCount = 0;
+    LoopDetected = false;
+    _AllocA( dd, MADDisasmDataSize() );
+    for( step = 0; step < AutoStepCount; ++step ) {
+        if( _IsOff( SW_HAVE_TASK ) ) {
+            printf( "  *** task terminated ***\n" );
+            break;
+        }
+        addr = GetCodeDot();
+        if( AutoLoopDetect )
+            LoopRecord( addr, step );
+        memset( dd, 0, MADDisasmDataSize() );
+        decoded = MADDisasm( dd, &addr, 0 ) == MS_OK;
+        if( decoded ) {
+            MADDisasmFormat( dd, MDP_ALL, CurrRadix, buff, sizeof( buff ) );
+            ctrl = MADDisasmControl( dd, &DbgRegs->mr );
+        } else {
+            buff[0] = NULLCHAR;
+            ctrl = 0;
+        }
+        type = ctrl & MDC_TYPE_MASK;
+        if( !AutoTraceCalls
+          || type == MDC_CALL || type == MDC_RET || type == MDC_SYSRET ) {
+            PrintStep( step, addr, decoded ? dd : NULL, buff );
+        }
+        if( step + 1 < AutoStepCount ) {
+            trace = TRACE_INTO;
+            if( AutoStepOver ) {
+                trace = TRACE_OVER;
+            } else if( !AutoStepIntoAPI && decoded ) {
+                if( type == MDC_SYSCALL ) {
+                    /* int XX: skip the interrupt handler */
+                    trace = TRACE_OVER;
+                } else if( type == MDC_CALL
+                  && MADDisasmInsNext( dd, &DbgRegs->mr, &target ) == MS_OK
+                  && DeAliasAddrMod( target, &mh ) == SR_NONE ) {
+                    /* call into code not covered by any module (OS/2 API): skip it */
+                    trace = TRACE_OVER;
+                }
+            }
+            ExecTrace( trace, LEVEL_ASM );
+            DoInput();
+        }
+        printf( "\n" );
+    }
+    printf( "=== Auto-Step complete ===\n" );
+}
+
+/*
+ * RunBreakMode - run the task at native speed until PC hits the requested
+ * address, then report the state (like td2ine --break-linear).
+ */
+static void RunBreakMode( void )
+{
+    brkp                *bp;
+    unsigned            conditions;
+    address             addr;
+    address             sp;
+    mad_disasm_data     *dd;
+    unsigned_8          bytes[16];
+    size_t              got;
+    unsigned            size;
+    unsigned            ins;
+    char                buff[256];
+    char                sbuff[256];
+    char                fbuf[256];
+    DIPHDL( cue, cueh );
+    unsigned            i;
+
+    bp = AddBreak( AutoBreakAddr );
+    if( bp == NULL ) {
+        printf( "autostep: --break-at: cannot set breakpoint at %04X:%04lX\n",
+                AutoBreakAddr.mach.segment, (unsigned long)AutoBreakAddr.mach.offset );
+        return;
+    }
+    for( ;; ) {
+        conditions = Go( true );
+        DoInput();
+        if( ( conditions & ( COND_BREAK | COND_USER | COND_STOP
+                           | COND_TERMINATE | COND_EXCEPTION ) ) != 0 )
+            break;
+        /* ignore library-load and other non-stop conditions */
+    }
+    RemoveBreak( AutoBreakAddr );
+    if( _IsOff( SW_HAVE_TASK ) ) {
+        printf( "=== break-at: task terminated before hitting %04X:%04lX ===\n",
+                AutoBreakAddr.mach.segment, (unsigned long)AutoBreakAddr.mach.offset );
+        return;
+    }
+    addr = GetCodeDot();
+    printf( "=== break at %04X:%04lX ===\n", addr.mach.segment, (unsigned long)addr.mach.offset );
+    DumpRegisters();
+    _AllocA( dd, MADDisasmDataSize() );
+    for( ins = 0; ins < 6; ++ins ) {
+        memset( dd, 0, MADDisasmDataSize() );
+        if( MADDisasm( dd, &addr, 0 ) != MS_OK )
+            break;
+        MADDisasmFormat( dd, MDP_ALL, CurrRadix, buff, sizeof( buff ) );
+        printf( "  %04X:%04lX: %s\n", addr.mach.segment, (unsigned long)addr.mach.offset, buff );
+        if( DeAliasAddrCue( NO_MOD, addr, cueh ) != SR_NONE
+          && DUIGetSourceLine( cueh, sbuff, sizeof( sbuff ) ) ) {
+            DIPCueFile( cueh, fbuf, sizeof( fbuf ) );
+            printf( "    DWARF: %s:%lu\n", fbuf, DIPCueLine( cueh ) );
+        }
+        size = MADDisasmInsSize( dd );
+        if( size == 0 )
+            break;
+        addr.mach.offset += size;
+    }
+    sp = GetRegSP();
+    got = MADCliReadMem( sp, 16, bytes );
+    printf( "  Stack: SS:SP=%04X:%04lX", sp.mach.segment, (unsigned long)sp.mach.offset );
+    for( i = 0; i + 1 < got; i += 2 ) {
+        printf( "  [%04lX]=%02X%02X", (unsigned long)( sp.mach.offset + i ), bytes[i + 1], bytes[i] );
+    }
+    printf( "\n" );
+}
+
+/*
+ * RunDumps - hexdump the requested guest memory ranges (like td2ine
+ * --dump-linear).
+ */
+static void RunDumps( void )
+{
+    unsigned_8          buf[16];
+    address             addr;
+    size_t              len;
+    size_t              chunk;
+    size_t              got;
+    unsigned            d;
+    unsigned            i;
+
+    for( d = 0; d < AutoDumpCount; ++d ) {
+        printf( "=== dump %04X:%04lX len 0x%X ===\n",
+                AutoDumpAddrs[d].mach.segment,
+                (unsigned long)AutoDumpAddrs[d].mach.offset,
+                (unsigned)AutoDumpLens[d] );
+        addr = AutoDumpAddrs[d];
+        len = AutoDumpLens[d];
+        while( len > 0 ) {
+            chunk = ( len > 16 ) ? 16 : len;
+            got = MADCliReadMem( addr, chunk, buf );
+            if( got < chunk ) {
+                printf( "  %04X:%04lX: <unreadable>\n", addr.mach.segment,
+                        (unsigned long)addr.mach.offset );
+            } else {
+                printf( "  %04X:%04lX: ", addr.mach.segment, (unsigned long)addr.mach.offset );
+                for( i = 0; i < chunk; ++i ) {
+                    printf( "%02X ", buf[i] );
+                }
+                printf( "|" );
+                for( i = 0; i < chunk; ++i ) {
+                    printf( "%c", ( buf[i] >= 32 && buf[i] < 127 ) ? buf[i] : '.' );
+                }
+                printf( "|\n" );
+            }
+            addr.mach.offset += chunk;
+            len -= chunk;
+        }
+    }
+}
+
 int main( int argc, char **argv )
 {
     char        cmd_line[256];
@@ -348,8 +985,14 @@ int main( int argc, char **argv )
 
     /* unused parameters */ (void)argc; (void)argv;
 
+    /* unbuffered output: engine error paths exit via DosExit (KillDebugger),
+     * which skips stdio flushing -- with buffering their messages are lost */
+    setvbuf( stdout, NULL, _IONBF, 0 );
+    setvbuf( stderr, NULL, _IONBF, 0 );
+
     MemInit();
     _bgetcmd( cmd_line, sizeof( cmd_line ) );
+    ParseAutoStepOptions( cmd_line );
     CmdData = cmd_line;
     DebugMain();
     DoInput();
@@ -361,13 +1004,31 @@ int main( int argc, char **argv )
     if( rc != 0 ) {
         printf( "Stubugger: Error creating thread!\n" );
     }
+    if( AutoHaveBreak || AutoDumpCount > 0 ) {
+        /* td2ine ordering: break/dump modes never fall through to autostep */
+        if( _IsOn( SW_HAVE_TASK ) ) {
+            if( AutoHaveBreak )
+                RunBreakMode();
+            RunDumps();
+        } else {
+            printf( "autostep: no task loaded\n" );
+        }
+        Done = true;
+    } else if( AutoStepCount > 0 ) {
+        if( _IsOn( SW_HAVE_TASK ) ) {
+            AutoStepRun();
+        } else {
+            printf( "autostep: no task loaded\n" );
+        }
+        Done = true;
+    }
     while( !Done ) {
         DlgCmd();
     }
+    RunRequest( REQ_BYE );
     DosCloseEventSem( Requestsem );
     DosCloseEventSem( Requestdonesem );
     DebugFini();
-    RunRequest( REQ_BYE );
     MemFini();
     return( 0 );
 }
@@ -397,7 +1058,9 @@ void DUIErrorBox( const char *text )
 
 void DUIStatusText( const char *text )
 {
-    printf( "STA %s\n", text );
+    if( text != NULL && text[0] != NULLCHAR ) {
+        printf( "STA %s\n", text );
+    }
 }
 
 bool DUIDlgGivenAddr( const char *title, address *value )
@@ -777,8 +1440,14 @@ void WndAsmInspect( address addr )
     mad_disasm_data     *dd;
 
     _AllocA( dd, MADDisasmDataSize() );
+    // must be zeroed: on a failed decode MADDisasmFormat would run on
+    // stale ins data (garbage opcode name index -> crash in MAD)
+    memset( dd, 0, MADDisasmDataSize() );
     for( i = 0; i < 10; ++i ) {
-        MADDisasm( dd, &addr, 0 );
+        if( MADDisasm( dd, &addr, 0 ) != MS_OK ) {
+            printf( "disasm failed\n" );
+            break;
+        }
         MADDisasmFormat( dd, MDP_ALL, CurrRadix, buff, sizeof( buff ) );
         InsMemRef( dd );
         printf( "%-40s%s\n", buff, TxtBuff );
